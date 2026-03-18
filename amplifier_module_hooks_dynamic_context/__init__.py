@@ -92,7 +92,7 @@ class LazyContextBlock:
 
         # Read from disk
         try:
-            content = Path(self.path).read_text(encoding="utf-8")
+            content = Path(self.path).expanduser().read_text(encoding="utf-8")
             cache[self.path] = content
             self._content = content
             logger.debug(
@@ -138,7 +138,7 @@ class DynamicContextManifest:
     def _load(self) -> None:
         """Parse the YAML manifest and populate ``self.blocks``."""
         try:
-            raw = Path(self.manifest_path).read_text(encoding="utf-8")
+            raw = Path(self.manifest_path).expanduser().read_text(encoding="utf-8")
         except OSError as exc:
             logger.warning(
                 "dynamic-context: Cannot read manifest at %s: %s",
@@ -530,6 +530,19 @@ async def mount(
         priority,
         manifest_path,
     )
+
+    # Also mount the companion load_context tool so the LLM can
+    # explicitly request context blocks.  Doing this here (instead of
+    # via a separate module entry) avoids source-based validation issues
+    # when both modules share the same Python package.
+    try:
+        from .tool import LoadContextTool
+
+        tool = LoadContextTool(coordinator=coordinator)
+        await coordinator.mount("tools", tool, name=tool.name)
+        logger.info("dynamic-context: Mounted companion load_context tool")
+    except Exception as tool_err:
+        logger.warning("dynamic-context: Failed to mount load_context tool: %s", tool_err)
 
 
 __all__ = [
