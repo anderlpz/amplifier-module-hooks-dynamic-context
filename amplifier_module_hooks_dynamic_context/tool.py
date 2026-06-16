@@ -245,7 +245,7 @@ class LoadContextTool:
 # ---------------------------------------------------------------------------
 
 
-async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> None:
+async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> dict[str, Any]:
     """
     Mount the load_context tool.
 
@@ -261,3 +261,8 @@ async def mount(coordinator: Any, config: dict[str, Any] | None = None) -> None:
     tool = LoadContextTool(coordinator=coordinator)
     await coordinator.mount("tools", tool, name=tool.name)
     logger.info("dynamic-context: Mounted load_context tool")
+    return {
+        "name": "tool-load-context",
+        "version": "0.1.0",
+        "provides": ["load_context"],
+    }

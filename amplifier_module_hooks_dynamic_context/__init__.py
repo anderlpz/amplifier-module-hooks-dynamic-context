@@ -28,6 +28,8 @@ Manifest YAML format:
 Config keys (in bundle YAML under module config):
     manifest_path: "/path/to/manifest.yaml"   # required; absolute or relative to working_dir
     priority:      20                          # hook priority (default: 20)
+    max_file_bytes: 65536                      # per-file size cap in bytes (default: 64KB)
+    max_injection_tokens: 32768               # total injection budget per turn (default: ~32K tokens)
 """
 
 from __future__ import annotations
@@ -72,7 +74,7 @@ class LazyContextBlock:
     # Per-instance content cache (set after first successful read)
     _content: str | None = field(default=None, repr=False, init=False, compare=False)
 
-    def load(self, cache: dict[str, str]) -> str | None:
+    def load(self, cache: dict[str, str], max_bytes: int = 0) -> str | None:
         """
         Return block content, reading from disk the first time.
 
@@ -80,6 +82,13 @@ class LazyContextBlock:
         files are only read once per session even if multiple callers ask
         for the same block.  Also sets ``_content`` on the instance as a
         secondary fast path.
+
+        Args:
+            cache:     Shared path -> content mapping (mutated in-place).
+            max_bytes: Per-file size cap in bytes.  When > 0 and the file
+                       exceeds this limit, a degradation notice is cached
+                       and returned instead of the full content so the
+                       model knows the file exists and how to access it.
         """
         # Fast path: already loaded on this instance
         if self._content is not None:
@@ -93,6 +102,26 @@ class LazyContextBlock:
         # Read from disk
         try:
             content = Path(self.path).expanduser().read_text(encoding="utf-8")
+            content_bytes = len(content.encode("utf-8"))
+            if max_bytes > 0 and content_bytes > max_bytes:
+                estimated_tokens = content_bytes // 4
+                notice = (
+                    f"[Content too large: {self.name} at {self.path} "
+                    f"is {content_bytes:,} bytes (~{estimated_tokens:,} tokens), "
+                    f"exceeds limit of {max_bytes:,} bytes. "
+                    f"Use read_file to access specific sections.]"
+                )
+                logger.warning(
+                    "dynamic-context: '%s' at %s is %d bytes, exceeds limit of %d — returning degradation notice",
+                    self.name,
+                    self.path,
+                    content_bytes,
+                    max_bytes,
+                )
+                # Cache the notice (not the full content) so we don't re-read from disk
+                cache[self.path] = notice
+                self._content = notice
+                return notice
             cache[self.path] = content
             self._content = content
             logger.debug(
@@ -308,11 +337,15 @@ class ContextLoaderHook:
         classifier: ContextClassifier,
         content_cache: dict[str, str],
         priority: int = 20,
+        max_file_bytes: int = 65536,
+        max_injection_tokens: int = 32768,
     ) -> None:
         self.manifest = manifest
         self.classifier = classifier
         self._content_cache = content_cache
         self.priority = priority
+        self.max_file_bytes = max_file_bytes
+        self.max_injection_tokens = max_injection_tokens
 
     def register(self, hooks: Any) -> None:
         """Register on ``provider:request`` (fires right before each LLM call)."""
@@ -341,8 +374,10 @@ class ContextLoaderHook:
         # Step 2: thin manifest — always present so the LLM can call load_context
         thin_manifest = self._build_thin_manifest()
 
-        # Step 3: load content for every active block
+        # Step 3: load content for every active block (budget-aware)
         content_parts: list[str] = []
+        tokens_used = len(thin_manifest) // 4  # thin manifest counts against budget
+        skipped_blocks: list[str] = []
         for block_name in sorted(self.classifier.active_tags):
             block = self.manifest.find(block_name)
             if block is None:
@@ -350,11 +385,34 @@ class ContextLoaderHook:
                     "dynamic-context: Active tag '%s' not found in manifest", block_name
                 )
                 continue
-            content = block.load(self._content_cache)
+            content = block.load(self._content_cache, max_bytes=self.max_file_bytes)
             if content:
+                content_tokens = len(content) // 4
+                if (
+                    self.max_injection_tokens > 0
+                    and tokens_used + content_tokens > self.max_injection_tokens
+                ):
+                    skipped_blocks.append(block_name)
+                    logger.warning(
+                        "dynamic-context: Skipping '%s' (%d tokens) — would exceed injection budget (%d/%d)",
+                        block_name,
+                        content_tokens,
+                        tokens_used,
+                        self.max_injection_tokens,
+                    )
+                    continue
+                tokens_used += content_tokens
                 content_parts.append(
                     f'<context_file source="dynamic-context:{block_name}">\n{content}\n</context_file>'
                 )
+
+        if skipped_blocks:
+            budget_notice = (
+                f"[Budget limit reached: {len(skipped_blocks)} context block(s) skipped "
+                f"({', '.join(skipped_blocks)}). "
+                f"Use load_context or read_file to access them manually.]"
+            )
+            content_parts.append(budget_notice)
 
         # Step 4: assemble injection
         parts = [thin_manifest]
@@ -427,7 +485,14 @@ class ContextLoaderHook:
             " or use load_context tool to load manually):",
         ]
         for block in self.manifest.blocks:
-            marker = " [loaded]" if block.name in self.classifier.active_tags else ""
+            if block.name in self.classifier.active_tags:
+                # Check if content is a degradation notice
+                if block._content and block._content.startswith("[Content too large:"):
+                    marker = " [too large — use read_file]"
+                else:
+                    marker = " [loaded]"
+            else:
+                marker = ""
             lines.append(f"- {block.name}: {block.description}{marker}")
         lines.append("</system-reminder>")
         return "\n".join(lines)
@@ -460,6 +525,16 @@ async def mount(
             priority (int, default 20):
                 Hook priority.  Runs after status-context (0) and
                 the reminder hook (priority 10) by default.
+
+            max_file_bytes (int, default 65536):
+                Maximum file size in bytes for any single context block.
+                Files exceeding this limit are replaced with a notice
+                directing the model to use read_file.
+
+            max_injection_tokens (int, default 32768):
+                Maximum total estimated tokens for all dynamic context
+                injections per turn (using len//4 approximation).
+                Blocks beyond budget are skipped with a notice.
 
     Graceful degradation:
         If ``manifest_path`` is missing, the file does not exist, or the
@@ -521,13 +596,24 @@ async def mount(
     # Register hook
     # ------------------------------------------------------------------ #
     priority: int = int(config.get("priority", 20))
-    loader = ContextLoaderHook(manifest, classifier, content_cache, priority=priority)
+    max_file_bytes: int = int(config.get("max_file_bytes", 65536))
+    max_injection_tokens: int = int(config.get("max_injection_tokens", 32768))
+    loader = ContextLoaderHook(
+        manifest,
+        classifier,
+        content_cache,
+        priority=priority,
+        max_file_bytes=max_file_bytes,
+        max_injection_tokens=max_injection_tokens,
+    )
     loader.register(coordinator.hooks)
 
     logger.info(
-        "dynamic-context: Mounted — %d context blocks, priority=%d, manifest=%s",
+        "dynamic-context: Mounted — %d context blocks, priority=%d, max_file_bytes=%d, max_injection_tokens=%d, manifest=%s",
         len(manifest.blocks),
         priority,
+        max_file_bytes,
+        max_injection_tokens,
         manifest_path,
     )
 
@@ -542,7 +628,9 @@ async def mount(
         await coordinator.mount("tools", tool, name=tool.name)
         logger.info("dynamic-context: Mounted companion load_context tool")
     except Exception as tool_err:
-        logger.warning("dynamic-context: Failed to mount load_context tool: %s", tool_err)
+        logger.warning(
+            "dynamic-context: Failed to mount load_context tool: %s", tool_err
+        )
 
 
 __all__ = [
